@@ -57,7 +57,7 @@ completions: completions/gsu.zsh completions/gsu.bash completions/gsu.fish
 	@echo "  ✓ Fish → $(FISH_COMP_DIR)/gsu.fish"
 
 lint:
-	@command -v shellcheck >/dev/null 2>&1 || { echo "shellcheck not found. Install: brew install shellcheck"; exit 1; }
+	@command -v shellcheck >/dev/null 2>&1 || { echo "shellcheck not found. Install shellcheck via your OS package manager."; exit 1; }
 	shellcheck -s bash gsu install.sh uninstall.sh
 	@echo "  ✓ Lint passed"
 

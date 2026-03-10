@@ -19,6 +19,16 @@
 
 ## Install
 
+### Platform support
+
+- macOS: supported (zsh/bash)
+- Linux: supported (bash/zsh/fish)
+- Windows: supported via WSL or Git Bash
+
+`gsu` is a Bash CLI, so the recommended universal installer is the raw `install.sh` script.
+
+Package managers (Homebrew/Scoop/winget) are planned. Until then, use curl/wget or `make install`.
+
 ### One-line (recommended)
 
 ```bash
@@ -29,6 +39,18 @@ Or with `wget`:
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/hetawk/gsu/main/install.sh | bash
+```
+
+Windows (PowerShell + Git Bash):
+
+```powershell
+bash -lc "curl -fsSL https://raw.githubusercontent.com/hetawk/gsu/main/install.sh | bash"
+```
+
+Windows (WSL):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hetawk/gsu/main/install.sh | bash
 ```
 
 After install, reload your shell:
@@ -220,7 +242,7 @@ curl -fsSL https://raw.githubusercontent.com/hetawk/gsu/main/uninstall.sh | bash
 git clone https://github.com/hetawk/gsu.git
 cd gsu
 make install    # install locally for testing
-make lint       # shellcheck (requires: brew install shellcheck)
+make lint       # shellcheck (install via your OS package manager)
 make test       # smoke tests
 ```
 
