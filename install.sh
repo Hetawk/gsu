@@ -10,6 +10,7 @@
 #    GSU_INSTALL_DIR   Default: ~/.local/bin
 #    GSU_NO_SHELL_HOOK Set to 1 to skip adding PATH/alias to shell rc
 #    GSU_NO_COMPLETIONS Set to 1 to skip installing shell completions
+#    GSU_CLEAN_OLD_ALIAS Set to 0 to keep legacy alias lines (default: 1)
 # ==============================================================================
 
 set -uo pipefail
@@ -21,6 +22,7 @@ GSU_CONFIG_DIR="${GSU_CONFIG_DIR:-$HOME/.config/gsu}"
 GSU_COMP_DIR_ZSH="${GSU_COMP_DIR_ZSH:-$HOME/.local/share/zsh/site-functions}"
 GSU_COMP_DIR_BASH="${GSU_COMP_DIR_BASH:-$HOME/.bash_completion.d}"
 GSU_COMP_DIR_FISH="${GSU_COMP_DIR_FISH:-$HOME/.config/fish/completions}"
+GSU_CLEAN_OLD_ALIAS="${GSU_CLEAN_OLD_ALIAS:-1}"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -69,6 +71,20 @@ _in_file() {
   grep -qF "$1" "$2" 2>/dev/null
 }
 
+# Remove legacy alias that masks the real gsu binary.
+_remove_legacy_gsu_alias() {
+  local rc_file="$1"
+  [[ -f "$rc_file" ]] || return 0
+
+  if grep -Eq '^[[:space:]]*alias[[:space:]]+gsu=.*git-switch-user' "$rc_file"; then
+    local tmp_file; tmp_file=$(mktemp)
+    awk '!/^[[:space:]]*alias[[:space:]]+gsu=.*git-switch-user/' "$rc_file" > "$tmp_file"
+    cat "$tmp_file" > "$rc_file"
+    rm -f "$tmp_file"
+    ok "Removed legacy alias: gsu=git-switch-user from $rc_file"
+  fi
+}
+
 # ── Main install ──────────────────────────────────────────────────────────────
 main() {
   echo
@@ -112,8 +128,12 @@ main() {
     echo
     info "Setting up shell integration ($sh → $rc_file)..."
 
+    if [[ "$GSU_CLEAN_OLD_ALIAS" == "1" ]]; then
+      _remove_legacy_gsu_alias "$rc_file"
+    fi
+
     # PATH
-    local path_line='export PATH="$HOME/.local/bin:$PATH"'
+    local path_line="export PATH=\"${GSU_INSTALL_DIR}:\$PATH\""
     if _in_file "$GSU_INSTALL_DIR" "$rc_file"; then
       ok "$GSU_INSTALL_DIR already in PATH via $rc_file"
     else
@@ -125,15 +145,20 @@ main() {
 
     # Aliases (skip for fish — fish uses functions)
     if [[ "$sh" != "fish" ]]; then
-      local alias_marker="alias gsu="
-      if _in_file "$alias_marker" "$rc_file"; then
-        ok "gsu aliases already present in $rc_file"
-      else
-        cat >> "$rc_file" <<'ALIASES'
-alias gsl='gsu list'
-alias gss='gsu show'
-ALIASES
+      local added_aliases=0
+      if ! _in_file "alias gsl='gsu list'" "$rc_file"; then
+        echo "alias gsl='gsu list'" >> "$rc_file"
+        added_aliases=1
+      fi
+      if ! _in_file "alias gss='gsu show'" "$rc_file"; then
+        echo "alias gss='gsu show'" >> "$rc_file"
+        added_aliases=1
+      fi
+
+      if [[ "$added_aliases" -eq 1 ]]; then
         ok "Added convenience aliases (gsl, gss) to $rc_file"
+      else
+        ok "Convenience aliases already present in $rc_file"
       fi
     fi
 

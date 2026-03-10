@@ -908,7 +908,7 @@ cmd_help() {
   echo
   echo -e "${BOLD}MAINTENANCE${NC}"
   echo "  gsu update                        Update gsu to latest version"
-  echo "  gsu version                       Show version"
+  echo "  gsu version | -v | --version      Show version"
   echo "  gsu completions [bash|zsh|fish]   Print shell completion script"
   echo
   echo -e "${BOLD}EXAMPLES${NC}"

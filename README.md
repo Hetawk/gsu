@@ -143,6 +143,8 @@ gsu import ~/gsu-backup.conf        # import users from file
 ```bash
 gsu update                          # download latest version from GitHub
 gsu version                         # show current version
+gsu -v                              # short version flag
+gsu --version                       # long version flag
 ```
 
 ### Shell completions
