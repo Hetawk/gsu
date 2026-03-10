@@ -1,0 +1,973 @@
+#!/usr/bin/env bash
+# ==============================================================================
+#  gsu — Git Switch User  v1.0.0
+#  Manage and switch between multiple Git identities
+#  https://github.com/hetawk/gsu
+#
+#  Usage:  gsu [command] [args...]
+#  Run:    gsu help
+# ==============================================================================
+
+GSU_VERSION="1.0.0"
+GSU_REPO="hetawk/gsu"
+GSU_CONFIG_DIR="${GSU_CONFIG_DIR:-$HOME/.config/gsu}"
+GSU_USERS_FILE="$GSU_CONFIG_DIR/users.conf"
+GSU_CURRENT_FILE="$GSU_CONFIG_DIR/current"
+GSU_INSTALL_DIR="${GSU_INSTALL_DIR:-$HOME/.local/bin}"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+if [[ -t 1 ]] && [[ "${NO_COLOR:-}" != "1" ]]; then
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+  BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'
+  NC='\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; NC=''
+fi
+
+# ── Output helpers ────────────────────────────────────────────────────────────
+ok()   { echo -e "${GREEN}✓${NC} $*"; }
+err()  { echo -e "${RED}✗${NC} $*" >&2; }
+warn() { echo -e "${YELLOW}!${NC} $*"; }
+info() { echo -e "${BLUE}→${NC} $*"; }
+hdr()  { echo -e "${BOLD}$*${NC}"; }
+die()  { err "$*"; exit 1; }
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+_ensure_config_dir() {
+  mkdir -p "$GSU_CONFIG_DIR"
+  if [[ ! -f "$GSU_USERS_FILE" ]]; then
+    cat > "$GSU_USERS_FILE" <<'CONF_EOF'
+# gsu — Git Switch User
+# Configuration file: ~/.config/gsu/users.conf
+#
+# Format: KEY|NAME|EMAIL|GITHUB_TOKENS|GITLAB_TOKENS|BITBUCKET_TOKENS|AZURE_TOKENS
+#
+# Token format (per service):
+#   Single token:   personal=ghp_yourtoken
+#   Multiple:       personal=ghp_token1,work=ghp_token2
+#
+# ⚠️  Tokens are stored in plain text. Protect this file:
+#   chmod 600 ~/.config/gsu/users.conf
+#
+# Example:
+#   mykey|Full Name|you@example.com|personal=ghp_xxx|||
+CONF_EOF
+    chmod 600 "$GSU_USERS_FILE"
+  fi
+}
+
+# Migrate from legacy ~/.config/git-users.conf (one-time)
+_migrate_legacy() {
+  local old_users="$HOME/.config/git-users.conf"
+  local old_current="$HOME/.config/git-current-user"
+
+  [[ -f "$old_users" ]] || return 0
+  [[ -f "$GSU_CONFIG_DIR/.migrated" ]] && return 0
+
+  _ensure_config_dir
+
+  local old_count
+  old_count=$(grep -v '^#' "$old_users" | grep -v '^[[:space:]]*$' | wc -l | tr -d ' ')
+  local new_count
+  new_count=$(grep -v '^#' "$GSU_USERS_FILE" 2>/dev/null | grep -v '^[[:space:]]*$' | wc -l | tr -d ' ')
+
+  if [[ "$old_count" -gt 0 && "$new_count" -eq 0 ]]; then
+    info "Migrating $old_count user(s) from legacy git-users.conf..."
+    grep -v '^#' "$old_users" | grep -v '^[[:space:]]*$' >> "$GSU_USERS_FILE"
+    [[ -f "$old_current" ]] && cp "$old_current" "$GSU_CURRENT_FILE"
+    touch "$GSU_CONFIG_DIR/.migrated"
+    ok "Migration complete."
+    echo
+  fi
+  return 0
+}
+
+# ── Data access ───────────────────────────────────────────────────────────────
+_data_lines() {
+  [[ -f "$GSU_USERS_FILE" ]] || return 0
+  grep -v '^#' "$GSU_USERS_FILE" | grep -v '^[[:space:]]*$'
+}
+
+_all_keys() {
+  _data_lines | cut -d'|' -f1
+}
+
+_get_field() {
+  # _get_field <line> <field_number_1based>
+  echo "$1" | cut -d'|' -f"$2"
+}
+
+# Set field (1-based) for a user; preserves comments and other lines
+_set_field() {
+  local key="$1" fnum="$2" val="$3"
+  [[ -f "$GSU_USERS_FILE" ]] || return 1
+  local tmp; tmp=$(mktemp)
+  awk -F'|' -v OFS='|' -v k="$key" -v f="$fnum" -v v="$val" '
+    /^#/ || /^[[:space:]]*$/ { print; next }
+    $1 == k { $f = v }
+    { print }
+  ' "$GSU_USERS_FILE" > "$tmp"
+  cat "$tmp" > "$GSU_USERS_FILE"
+  rm -f "$tmp"
+}
+
+_find_user() {
+  _data_lines | grep "^${1}|" | head -n1
+}
+
+_user_exists() {
+  [[ -n "$(_find_user "$1")" ]]
+}
+
+_get_current() {
+  [[ -f "$GSU_CURRENT_FILE" ]] && cat "$GSU_CURRENT_FILE" | tr -d '[:space:]' || echo ""
+}
+
+_set_current() {
+  echo "$1" > "$GSU_CURRENT_FILE"
+}
+
+_field_num() {
+  case "$1" in
+    github|gh)    echo 4 ;;
+    gitlab|gl)    echo 5 ;;
+    bitbucket|bb) echo 6 ;;
+    azure|az)     echo 7 ;;
+    *)            die "Unknown service '$1'. Use: github, gitlab, bitbucket, azure" ;;
+  esac
+}
+
+# Mask token values for display  (label=abcd1234**** format)
+_mask_tokens_field() {
+  local field="$1"
+  [[ -z "$field" ]] && return
+  local result=""
+  while IFS='=' read -r lbl tok; do
+    if [[ -n "$tok" ]]; then
+      local masked="${tok:0:8}****"
+      # Don't show real chars if token is too short
+      [[ ${#tok} -le 8 ]] && masked="****"
+      result="${result:+$result, }${lbl}=${masked}"
+    fi
+  done < <(echo "$field" | tr ',' '\n')
+  echo "$result"
+}
+
+# Clear credentials for a git host (works with any configured credential helper)
+_clear_cred() {
+  local host="$1"
+  printf "protocol=https\nhost=%s\n\n" "$host" | git credential reject 2>/dev/null || true
+}
+
+# ── Core commands ─────────────────────────────────────────────────────────────
+
+cmd_show() {
+  local key="${1:-}"
+
+  if [[ -z "$key" ]]; then
+    local name; name=$(git config --global user.name 2>/dev/null || echo "(not set)")
+    local email; email=$(git config --global user.email 2>/dev/null || echo "(not set)")
+    local gsu_key; gsu_key=$(_get_current)
+    echo
+    hdr "  Current Git Identity"
+    echo "  ─────────────────────────────"
+    echo "  Name:   ${BOLD}$name${NC}"
+    echo "  Email:  $email"
+    if [[ -n "$gsu_key" ]]; then
+      echo "  Key:    ${CYAN}$gsu_key${NC}"
+    else
+      echo "  ${DIM}Key: (not set via gsu)${NC}"
+    fi
+    echo
+    return 0
+  fi
+
+  _ensure_config_dir
+  local line; line=$(_find_user "$key")
+  [[ -z "$line" ]] && die "User '$key' not found."
+
+  local uname; uname=$(_get_field "$line" 2)
+  local email; email=$(_get_field "$line" 3)
+  local gh; gh=$(_get_field "$line" 4)
+  local gl; gl=$(_get_field "$line" 5)
+  local bb; bb=$(_get_field "$line" 6)
+  local az; az=$(_get_field "$line" 7)
+
+  local disp_gh disp_gl disp_bb disp_az
+  [[ -n "$gh" ]] && disp_gh=$(_mask_tokens_field "$gh") || disp_gh="${DIM}(none)${NC}"
+  [[ -n "$gl" ]] && disp_gl=$(_mask_tokens_field "$gl") || disp_gl="${DIM}(none)${NC}"
+  [[ -n "$bb" ]] && disp_bb=$(_mask_tokens_field "$bb") || disp_bb="${DIM}(none)${NC}"
+  [[ -n "$az" ]] && disp_az=$(_mask_tokens_field "$az") || disp_az="${DIM}(none)${NC}"
+
+  echo
+  hdr "  User: $key"
+  echo "  ─────────────────────────────"
+  echo "  Name:       $uname"
+  echo "  Email:      $email"
+  echo -e "  GitHub:     $disp_gh"
+  echo -e "  GitLab:     $disp_gl"
+  echo -e "  Bitbucket:  $disp_bb"
+  echo -e "  Azure:      $disp_az"
+  echo
+}
+
+cmd_list() {
+  _ensure_config_dir
+  _migrate_legacy
+
+  local keys=()
+  while IFS= read -r k; do [[ -n "$k" ]] && keys+=("$k"); done < <(_all_keys)
+
+  if [[ ${#keys[@]} -eq 0 ]]; then
+    warn "No users configured yet."
+    echo "  Run ${BOLD}gsu add${NC} to add your first user."
+    echo
+    return 1
+  fi
+
+  local current; current=$(_get_current)
+  echo
+  hdr "  Available Git Users"
+  echo "  ─────────────────────────────────────────────────────"
+  local i=1
+  for key in "${keys[@]}"; do
+    local line; line=$(_find_user "$key")
+    local uname; uname=$(_get_field "$line" 2)
+    local email; email=$(_get_field "$line" 3)
+    if [[ "$key" == "$current" ]]; then
+      echo -e "  ${GREEN}▸${NC} ${BOLD}${i}) ${key}${NC} — $uname <$email>  ${DIM}← active${NC}"
+    else
+      echo -e "    ${i}) ${CYAN}${key}${NC} — $uname <$email>"
+    fi
+    ((i++))
+  done
+  echo
+}
+
+cmd_use() {
+  _ensure_config_dir
+  _migrate_legacy
+
+  local key="${1:-}"
+
+  if [[ -z "$key" ]]; then
+    cmd_list || return 1
+    printf "Select user (number or key): "
+    read -r sel || return 1
+    sel="${sel// /}"
+    if [[ "$sel" =~ ^[0-9]+$ ]]; then
+      local keys=()
+      while IFS= read -r k; do [[ -n "$k" ]] && keys+=("$k"); done < <(_all_keys)
+      local idx=$(( sel - 1 ))
+      [[ $idx -lt 0 || $idx -ge ${#keys[@]} ]] && die "Invalid selection: $sel"
+      key="${keys[$idx]}"
+    else
+      key="$sel"
+    fi
+  fi
+
+  local line; line=$(_find_user "$key")
+  [[ -z "$line" ]] && die "User '$key' not found. Run 'gsu list' to see available users."
+
+  local uname; uname=$(_get_field "$line" 2)
+  local email; email=$(_get_field "$line" 3)
+
+  git config --global user.name  "$uname"
+  git config --global user.email "$email"
+  _set_current "$key"
+
+  echo
+  ok "Switched to user: ${BOLD}$key${NC}"
+  echo "  Name:  $uname"
+  echo "  Email: $email"
+
+  # Clear cached credentials so the new identity takes effect
+  info "Clearing cached credentials..."
+  _clear_cred github.com
+  _clear_cred gitlab.com
+  _clear_cred bitbucket.org
+  _clear_cred dev.azure.com
+  echo
+}
+
+cmd_add() {
+  _ensure_config_dir
+
+  local key="${1:-}" uname="${2:-}" email="${3:-}"
+
+  if [[ -z "$key" ]]; then
+    printf "User key (e.g. personal, work, hetawk): "
+    read -r key || return 1
+    key="${key// /}"
+  fi
+  [[ -z "$key" ]] && die "User key cannot be empty."
+  _user_exists "$key" && die "User '$key' already exists. Use 'gsu edit $key' to update."
+
+  if [[ -z "$uname" ]]; then
+    printf "Full name: "
+    read -r uname || return 1
+  fi
+  [[ -z "$uname" ]] && die "Name cannot be empty."
+
+  if [[ -z "$email" ]]; then
+    printf "Email address: "
+    read -r email || return 1
+  fi
+  [[ -z "$email" ]] && die "Email cannot be empty."
+
+  echo "${key}|${uname}|${email}||||" >> "$GSU_USERS_FILE"
+  echo
+  ok "Added user: ${BOLD}$key${NC} — $uname <$email>"
+  echo
+  printf "Set a GitHub token now? (y/N): "
+  read -r yn || true
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    cmd_token "$key" github
+  else
+    info "You can add tokens later with: gsu token $key github"
+  fi
+  echo
+}
+
+cmd_remove() {
+  _ensure_config_dir
+
+  local key="${1:-}"
+  if [[ -z "$key" ]]; then
+    cmd_list || return 1
+    printf "User to remove: "
+    read -r key || return 1
+    key="${key// /}"
+  fi
+
+  _user_exists "$key" || die "User '$key' not found."
+
+  local line; line=$(_find_user "$key")
+  local uname; uname=$(_get_field "$line" 2)
+  local email; email=$(_get_field "$line" 3)
+
+  echo
+  warn "You are about to remove: ${BOLD}$key${NC} ($uname <$email>)"
+  printf "Confirm removal? (y/N): "
+  read -r confirm || true
+  [[ "$confirm" =~ ^[Yy]$ ]] || { info "Aborted."; echo; return 0; }
+
+  local tmp; tmp=$(mktemp)
+  grep -v "^${key}|" "$GSU_USERS_FILE" > "$tmp"
+  cat "$tmp" > "$GSU_USERS_FILE"
+  rm -f "$tmp"
+
+  # Clear current if it was the removed user
+  local current; current=$(_get_current)
+  [[ "$current" == "$key" ]] && echo "" > "$GSU_CURRENT_FILE"
+
+  echo
+  ok "Removed user: $key"
+  echo
+}
+
+cmd_edit() {
+  _ensure_config_dir
+
+  local key="${1:-}"
+  if [[ -z "$key" ]]; then
+    cmd_list || return 1
+    printf "User to edit: "
+    read -r key || return 1
+    key="${key// /}"
+  fi
+
+  _user_exists "$key" || die "User '$key' not found."
+
+  local line; line=$(_find_user "$key")
+  local old_name; old_name=$(_get_field "$line" 2)
+  local old_email; old_email=$(_get_field "$line" 3)
+
+  echo
+  hdr "Editing user: $key"
+  echo "  (press Enter to keep current value)"
+  echo
+
+  printf "Name [%s]: " "$old_name"
+  read -r new_name || true
+  printf "Email [%s]: " "$old_email"
+  read -r new_email || true
+
+  local name="${new_name:-$old_name}"
+  local email="${new_email:-$old_email}"
+
+  _set_field "$key" 2 "$name"
+  _set_field "$key" 3 "$email"
+
+  echo
+  ok "Updated: ${BOLD}$key${NC} — $name <$email>"
+
+  # If this is the currently active user, also update global git config
+  local current; current=$(_get_current)
+  if [[ "$current" == "$key" ]]; then
+    git config --global user.name  "$name"
+    git config --global user.email "$email"
+    info "Also updated global git config (was active user)."
+  fi
+  echo
+}
+
+# ── Token management ──────────────────────────────────────────────────────────
+
+cmd_token() {
+  _ensure_config_dir
+
+  local key="${1:-}" service="${2:-}" token="${3:-}"
+
+  if [[ -z "$key" ]]; then
+    cmd_list || return 1
+    printf "User key: "
+    read -r key || return 1
+    key="${key// /}"
+  fi
+
+  _user_exists "$key" || die "User '$key' not found."
+
+  if [[ -z "$service" ]]; then
+    echo "  Services: github, gitlab, bitbucket, azure"
+    printf "Service: "
+    read -r service || return 1
+    service="${service// /}"
+  fi
+
+  local fnum; fnum=$(_field_num "$service")
+
+  if [[ -z "$token" ]]; then
+    local line; line=$(_find_user "$key")
+    local current_val; current_val=$(_get_field "$line" "$fnum")
+    if [[ -n "$current_val" ]]; then
+      echo
+      info "Existing tokens for $service ($key):"
+      echo "$current_val" | tr ',' '\n' | while IFS='=' read -r lbl tok; do
+        printf "    %-20s %s\n" "$lbl" "${tok:0:8}****"
+      done
+    fi
+    echo
+    echo "  Format tips:"
+    echo "    Plain token:      ${DIM}ghp_yourtoken${NC}    → saved as personal=..."
+    echo "    Named token:      ${DIM}label=ghp_yourtoken${NC}"
+    echo "    Multiple tokens:  ${DIM}label1=token1,label2=token2${NC}"
+    echo
+    printf "Token (Enter to skip): "
+    read -rs token; echo
+  fi
+
+  [[ -z "$token" ]] && { info "Skipped."; return 0; }
+
+  # Ensure label=value format
+  [[ "$token" =~ = ]] || token="personal=$token"
+
+  # Merge token into current field value
+  local label; label="${token%%=*}"
+  local line; line=$(_find_user "$key")
+  local current_val; current_val=$(_get_field "$line" "$fnum")
+
+  if [[ -n "$current_val" ]]; then
+    if echo "$current_val" | grep -qE "(^|,)${label}="; then
+      # Replace
+      current_val=$(echo "$current_val" | sed "s/${label}=[^,]*/${token}/")
+    else
+      current_val="${current_val},${token}"
+    fi
+  else
+    current_val="$token"
+  fi
+
+  _set_field "$key" "$fnum" "$current_val"
+  echo
+  ok "Token set for ${BOLD}$service${NC} (user: $key, label: $label)"
+  echo
+}
+
+cmd_token_remove() {
+  _ensure_config_dir
+
+  local key="${1:-}" service="${2:-}" label="${3:-}"
+
+  [[ -z "$key" ]] && die "Usage: gsu token-remove <key> <service> [label]"
+  _user_exists "$key" || die "User '$key' not found."
+  [[ -z "$service" ]] && die "Usage: gsu token-remove <key> <service> [label]"
+
+  local fnum; fnum=$(_field_num "$service")
+  local line; line=$(_find_user "$key")
+  local current_val; current_val=$(_get_field "$line" "$fnum")
+
+  [[ -z "$current_val" ]] && die "No tokens configured for $service ($key)."
+
+  if [[ -z "$label" ]]; then
+    info "Tokens for $service ($key):"
+    echo "$current_val" | tr ',' '\n' | while IFS='=' read -r lbl tok; do
+      printf "    %s\n" "$lbl"
+    done
+    printf "Label to remove: "
+    read -r label || return 1
+  fi
+
+  if echo "$current_val" | grep -qE "(^|,)${label}="; then
+    if [[ "$current_val" =~ ^${label}= ]] && [[ ! "$current_val" =~ , ]]; then
+      current_val=""
+    elif [[ "$current_val" =~ ^${label}=.*,.* ]]; then
+      current_val=$(echo "$current_val" | sed "s/^${label}=[^,]*,//")
+    else
+      current_val=$(echo "$current_val" | sed "s/,${label}=[^,]*//")
+    fi
+    _set_field "$key" "$fnum" "$current_val"
+    ok "Removed token '$label' from $service ($key)"
+  else
+    die "Label '$label' not found in $service tokens for $key."
+  fi
+}
+
+cmd_tokens() {
+  _ensure_config_dir
+
+  local key="${1:-}"
+  if [[ -z "$key" ]]; then
+    cmd_list || return 1
+    printf "User key: "
+    read -r key || return 1
+    key="${key// /}"
+  fi
+
+  _user_exists "$key" || die "User '$key' not found."
+
+  local line; line=$(_find_user "$key")
+  local services=("github" "gitlab" "bitbucket" "azure")
+  local fnums=(4 5 6 7)
+
+  echo
+  hdr "  Tokens for user: $key"
+  echo "  ─────────────────────────────"
+  for i in "${!services[@]}"; do
+    local svc="${services[$i]}"
+    local fnum="${fnums[$i]}"
+    local val; val=$(_get_field "$line" "$fnum")
+    if [[ -n "$val" ]]; then
+      echo -e "  ${CYAN}$svc${NC}:"
+      echo "$val" | tr ',' '\n' | while IFS='=' read -r lbl tok; do
+        [[ -n "$tok" ]] && printf "    %-20s %s\n" "$lbl" "${tok:0:8}****"
+      done
+    else
+      echo -e "  ${DIM}$svc: (none)${NC}"
+    fi
+  done
+  echo
+
+  printf "Add/update a token now? (y/N): "
+  read -r yn || true
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    printf "Service (github/gitlab/bitbucket/azure): "
+    read -r svc || return 1
+    cmd_token "$key" "$svc"
+  fi
+}
+
+# ── Import / Export ───────────────────────────────────────────────────────────
+
+cmd_export() {
+  _ensure_config_dir
+  _migrate_legacy
+
+  local outfile="${1:-}"
+  local keys=()
+  while IFS= read -r k; do [[ -n "$k" ]] && keys+=("$k"); done < <(_all_keys)
+  [[ ${#keys[@]} -eq 0 ]] && die "No users to export."
+
+  local content
+  content="# gsu users export — $(date '+%Y-%m-%d %H:%M')
+# Source: $HOSTNAME
+# Format: KEY|NAME|EMAIL|GITHUB_TOKENS|GITLAB_TOKENS|BITBUCKET_TOKENS|AZURE_TOKENS
+# ⚠  Tokens are MASKED in this export (replaced with ****)
+# Import with: gsu import <file>
+"
+
+  while IFS= read -r line; do
+    # Mask all token values (replace =value with =****)
+    content+="$(echo "$line" | sed 's/=[^,|]*/=****/g')
+"
+  done < <(_data_lines)
+
+  if [[ -n "$outfile" ]]; then
+    echo "$content" > "$outfile"
+    ok "Exported ${#keys[@]} user(s) to $outfile"
+    info "Tokens are masked for safe sharing."
+  else
+    echo "$content"
+  fi
+}
+
+cmd_import() {
+  _ensure_config_dir
+
+  local infile="${1:-}"
+  if [[ -z "$infile" ]]; then
+    printf "File to import from: "
+    read -r infile || return 1
+  fi
+  [[ ! -f "$infile" ]] && die "File not found: $infile"
+
+  local imported=0 skipped=0
+  echo
+  while IFS= read -r line; do
+    [[ "$line" =~ ^# ]] && continue
+    [[ -z "${line// /}" ]] && continue
+    local key; key=$(echo "$line" | cut -d'|' -f1)
+    if _user_exists "$key"; then
+      warn "  Skipping existing user: $key"
+      ((skipped++))
+    else
+      echo "$line" >> "$GSU_USERS_FILE"
+      ok "  Imported: $key"
+      ((imported++))
+    fi
+  done < "$infile"
+
+  echo
+  ok "Import complete: ${BOLD}$imported${NC} imported, $skipped skipped."
+  echo
+}
+
+# ── Self-update ───────────────────────────────────────────────────────────────
+
+cmd_update() {
+  local url="https://raw.githubusercontent.com/${GSU_REPO}/main/gsu"
+  local self; self=$(command -v gsu 2>/dev/null)
+  [[ -z "$self" ]] && die "Cannot locate the gsu binary. Set GSU_INSTALL_DIR or update PATH."
+
+  info "Checking for updates..."
+
+  local fetcher=""
+  command -v curl &>/dev/null && fetcher="curl"
+  command -v wget &>/dev/null && [[ -z "$fetcher" ]] && fetcher="wget"
+  [[ -z "$fetcher" ]] && die "curl or wget is required for updates."
+
+  local new_version
+  if [[ "$fetcher" == "curl" ]]; then
+    new_version=$(curl -fsSL "$url" 2>/dev/null | grep '^GSU_VERSION=' | head -n1 | tr -d '"' | cut -d'=' -f2)
+  else
+    new_version=$(wget -qO- "$url" 2>/dev/null | grep '^GSU_VERSION=' | head -n1 | tr -d '"' | cut -d'=' -f2)
+  fi
+
+  [[ -z "$new_version" ]] && die "Could not fetch version info from GitHub. Check your connection."
+
+  if [[ "$new_version" == "$GSU_VERSION" ]]; then
+    ok "Already up to date (v$GSU_VERSION)"
+    return 0
+  fi
+
+  info "Updating gsu v$GSU_VERSION → v$new_version..."
+
+  local tmpbin; tmpbin=$(mktemp)
+  if [[ "$fetcher" == "curl" ]]; then
+    curl -fsSL "$url" -o "$tmpbin" || die "Download failed."
+  else
+    wget -qO "$tmpbin" "$url" || die "Download failed."
+  fi
+
+  chmod +x "$tmpbin"
+  mv "$tmpbin" "$self"
+
+  ok "Updated to v$new_version"
+  echo
+}
+
+# ── Local repo identity ───────────────────────────────────────────────────────
+
+cmd_local() {
+  local key="${1:-}"
+  local git_dir
+
+  # Check we're in a git repo
+  git_dir=$(git rev-parse --git-dir 2>/dev/null) || die "Not in a git repository."
+
+  if [[ -z "$key" ]]; then
+    # Show local override (if any)
+    local local_name; local_name=$(git config --local user.name 2>/dev/null || echo "")
+    local local_email; local_email=$(git config --local user.email 2>/dev/null || echo "")
+    if [[ -n "$local_name" || -n "$local_email" ]]; then
+      hdr "Local Git Identity (this repo):"
+      echo "  Name:   ${local_name:-(not set)}"
+      echo "  Email:  ${local_email:-(not set)}"
+    else
+      info "No local identity set. Using global: $(git config --global user.email 2>/dev/null)"
+    fi
+    echo
+    printf "Set a local identity? (y/N): "
+    read -r yn || return 0
+    [[ "$yn" =~ ^[Yy]$ ]] || return 0
+    cmd_list || return 1
+    printf "User key: "
+    read -r key || return 1
+    key="${key// /}"
+  fi
+
+  _user_exists "$key" || die "User '$key' not found."
+
+  local line; line=$(_find_user "$key")
+  local uname; uname=$(_get_field "$line" 2)
+  local email; email=$(_get_field "$line" 3)
+
+  git config --local user.name  "$uname"
+  git config --local user.email "$email"
+
+  echo
+  ok "Local identity set to ${BOLD}$key${NC} for this repo"
+  echo "  Name:  $uname"
+  echo "  Email: $email"
+  info "Overrides global config in this repo only."
+  echo
+}
+
+cmd_local_clear() {
+  git rev-parse --git-dir &>/dev/null || die "Not in a git repository."
+  git config --local --unset user.name  2>/dev/null || true
+  git config --local --unset user.email 2>/dev/null || true
+  ok "Local git identity override removed."
+  echo
+}
+
+# ── Shell completions ─────────────────────────────────────────────────────────
+
+cmd_completions() {
+  local shell="${1:-zsh}"
+  case "$shell" in
+    zsh)  _comp_zsh ;;
+    bash) _comp_bash ;;
+    fish) _comp_fish ;;
+    *)    die "Unknown shell '$shell'. Supported: zsh, bash, fish" ;;
+  esac
+}
+
+_comp_zsh() {
+cat <<'ZSH_COMP'
+#compdef gsu
+
+_gsu() {
+  local -a commands users
+  commands=(
+    'list:List all configured users'
+    'ls:List all configured users'
+    'use:Switch to a user'
+    'add:Add a new user'
+    'remove:Remove a user'
+    'rm:Remove a user'
+    'edit:Edit a user'
+    'show:Show user details'
+    'token:Set/update a token'
+    'tokens:Manage all tokens for a user'
+    'token-remove:Remove a specific token'
+    'local:Set per-repo git identity'
+    'local-clear:Remove per-repo identity override'
+    'export:Export users to file (tokens masked)'
+    'import:Import users from file'
+    'update:Update gsu to latest version'
+    'version:Show version'
+    'completions:Print shell completions'
+    'help:Show help'
+  )
+
+  local user_keys
+  user_keys=($(gsu _keys 2>/dev/null))
+  local services=(github gitlab bitbucket azure)
+
+  case $CURRENT in
+    2)
+      _describe 'command'  commands
+      _describe 'user key' user_keys && ret=0
+      ;;
+    3)
+      case ${words[2]} in
+        use|show|remove|rm|edit|tokens|token|token-remove|local)
+          compadd -a user_keys ;;
+        completions)
+          compadd bash zsh fish ;;
+      esac
+      ;;
+    4)
+      case ${words[2]} in
+        token|token-remove)
+          compadd -a services ;;
+      esac
+      ;;
+  esac
+}
+
+_gsu "$@"
+ZSH_COMP
+}
+
+_comp_bash() {
+cat <<'BASH_COMP'
+_gsu_completions() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local prev="${COMP_WORDS[COMP_CWORD-1]}"
+  local cmds="list ls use add remove rm edit show token tokens token-remove local local-clear export import update version completions help"
+  local user_keys; user_keys=$(gsu _keys 2>/dev/null | tr '\n' ' ')
+  local services="github gitlab bitbucket azure"
+  COMPREPLY=()
+
+  case "$prev" in
+    gsu)
+      COMPREPLY=($(compgen -W "$cmds $user_keys" -- "$cur")) ;;
+    use|show|remove|rm|edit|tokens|token|token-remove|local)
+      COMPREPLY=($(compgen -W "$user_keys" -- "$cur")) ;;
+    completions)
+      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
+  esac
+
+  # 4th word: service name after token/token-remove <user>
+  if [[ ${COMP_CWORD} -eq 3 ]]; then
+    case "${COMP_WORDS[1]}" in
+      token|token-remove)
+        COMPREPLY=($(compgen -W "$services" -- "$cur")) ;;
+    esac
+  fi
+}
+
+complete -F _gsu_completions gsu
+BASH_COMP
+}
+
+_comp_fish() {
+cat <<'FISH_COMP'
+function __gsu_users
+    gsu _keys 2>/dev/null
+end
+
+set -l gsu_cmds list ls use add remove rm edit show token tokens token-remove local local-clear export import update version completions help
+
+complete -c gsu -f
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "(__gsu_users)" -d "Switch to user"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "list ls"       -d "List users"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "use"           -d "Switch user"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "add"           -d "Add new user"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "remove rm"     -d "Remove user"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "edit"          -d "Edit user"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "show"          -d "Show user details"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "token"         -d "Set a token"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "tokens"        -d "Manage tokens"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "token-remove"  -d "Remove a token"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "local"         -d "Per-repo identity"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "local-clear"   -d "Clear per-repo identity"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "export"        -d "Export users"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "import"        -d "Import users"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "update"        -d "Update gsu"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "version"       -d "Show version"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "help"          -d "Show help"
+
+complete -c gsu -n "__fish_seen_subcommand_from use show remove rm edit tokens token token-remove local" \
+  -a "(__gsu_users)"
+
+complete -c gsu -n "__fish_seen_subcommand_from token token-remove; and test (count (commandline -opc)) -eq 3" \
+  -a "github gitlab bitbucket azure"
+
+complete -c gsu -n "__fish_seen_subcommand_from completions" -a "bash zsh fish"
+FISH_COMP
+}
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+  echo
+  echo -e "${BOLD}gsu${NC} — Git Switch User  ${DIM}v${GSU_VERSION}${NC}"
+  echo -e "${DIM}Manage and switch between multiple Git identities${NC}"
+  echo
+  echo -e "${BOLD}USAGE${NC}"
+  echo "  gsu [command] [args...]"
+  echo "  gsu <key>                         Switch to a user directly (shorthand)"
+  echo
+  echo -e "${BOLD}IDENTITY COMMANDS${NC}"
+  echo "  gsu                               Show current Git identity"
+  echo "  gsu list | ls                     List all configured users"
+  echo "  gsu use   <key>                   Switch to user (clears cached creds)"
+  echo "  gsu show  [key]                   Show current user or details for <key>"
+  echo
+  echo -e "${BOLD}USER MANAGEMENT${NC}"
+  echo "  gsu add   [key] [name] [email]    Add a user (interactive if args omitted)"
+  echo "  gsu edit  <key>                   Edit a user's name/email"
+  echo "  gsu rm | remove  <key>            Remove a user"
+  echo
+  echo -e "${BOLD}TOKEN MANAGEMENT${NC}"
+  echo "  gsu token         <key> <service> [token]  Set/update a token"
+  echo "  gsu tokens        <key>                    View & manage all tokens"
+  echo "  gsu token-remove  <key> <service> [label]  Remove a specific token"
+  echo "  Services: github, gitlab, bitbucket, azure"
+  echo
+  echo -e "${BOLD}PER-REPO IDENTITY${NC}"
+  echo "  gsu local        [key]            Set local identity for current repo"
+  echo "  gsu local-clear                   Remove local identity override"
+  echo
+  echo -e "${BOLD}IMPORT / EXPORT${NC}"
+  echo "  gsu export  [file]                Export users (tokens masked)"
+  echo "  gsu import  <file>                Import users from a .conf file"
+  echo
+  echo -e "${BOLD}MAINTENANCE${NC}"
+  echo "  gsu update                        Update gsu to latest version"
+  echo "  gsu version                       Show version"
+  echo "  gsu completions [bash|zsh|fish]   Print shell completion script"
+  echo
+  echo -e "${BOLD}EXAMPLES${NC}"
+  echo "  gsu hetawk                        Switch to 'hetawk' profile"
+  echo "  gsu add work 'Jane Doe' jane@work.com"
+  echo "  gsu token hetawk github           Interactively set GitHub token"
+  echo "  gsu local work                    Use 'work' identity in this repo only"
+  echo "  gsu export ~/gsu-backup.conf      Backup users (tokens masked)"
+  echo
+  echo -e "${DIM}Config dir: $GSU_CONFIG_DIR${NC}"
+  echo -e "${DIM}GitHub:     https://github.com/$GSU_REPO${NC}"
+  echo
+}
+
+# ── Internal helpers (for completions) ───────────────────────────────────────
+
+_cmd_keys() {
+  _all_keys
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+main() {
+  _ensure_config_dir
+
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    "")                       _migrate_legacy; cmd_show ;;
+    current|show|whoami)      _migrate_legacy; cmd_show "${2:-}" ;;
+    list|ls)                  cmd_list ;;
+    use|switch)               cmd_use "${2:-}" ;;
+    add|new)                  cmd_add "${2:-}" "${3:-}" "${4:-}" ;;
+    remove|rm|delete|del)     cmd_remove "${2:-}" ;;
+    edit|update-user)         cmd_edit "${2:-}" ;;
+    token)                    cmd_token "${2:-}" "${3:-}" "${4:-}" ;;
+    tokens)                   cmd_tokens "${2:-}" ;;
+    token-remove|token-rm)    cmd_token_remove "${2:-}" "${3:-}" "${4:-}" ;;
+    local)                    _migrate_legacy; cmd_local "${2:-}" ;;
+    local-clear)              cmd_local_clear ;;
+    export)                   cmd_export "${2:-}" ;;
+    import)                   cmd_import "${2:-}" ;;
+    update)                   cmd_update ;;
+    version|-v|--version)     echo "gsu v$GSU_VERSION" ;;
+    completions|completion)   cmd_completions "${2:-zsh}" ;;
+    help|-h|--help)           cmd_help ;;
+    _keys)                    _cmd_keys ;;   # internal — for completions
+    *)
+      # Direct user switch shorthand: gsu <key>
+      _migrate_legacy
+      if _user_exists "$cmd"; then
+        cmd_use "$cmd"
+      else
+        err "Unknown command or user: '${cmd}'"
+        echo "  Run ${BOLD}gsu help${NC} for usage, or ${BOLD}gsu list${NC} to see users." >&2
+        exit 1
+      fi
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,19 @@
+# OS / system
+.DS_Store
+Thumbs.db
+
+# Local testing artifacts
+*.log
+*.tmp
+tmp/
+dist/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Don't ever commit user configs with tokens
+*.conf
+!completions/
