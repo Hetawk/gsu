@@ -67,9 +67,9 @@ _migrate_legacy() {
   _ensure_config_dir
 
   local old_count
-  old_count=$(grep -v '^#' "$old_users" | grep -v '^[[:space:]]*$' | wc -l | tr -d ' ')
+  old_count=$(grep -cEv '^#|^[[:space:]]*$' "$old_users") || old_count=0
   local new_count
-  new_count=$(grep -v '^#' "$GSU_USERS_FILE" 2>/dev/null | grep -v '^[[:space:]]*$' | wc -l | tr -d ' ')
+  new_count=$(grep -cEv '^#|^[[:space:]]*$' "$GSU_USERS_FILE" 2>/dev/null) || new_count=0
 
   if [[ "$old_count" -gt 0 && "$new_count" -eq 0 ]]; then
     info "Migrating $old_count user(s) from legacy git-users.conf..."
@@ -665,6 +665,7 @@ cmd_token() {
   if [[ -n "$current_val" ]]; then
     if echo "$current_val" | grep -qE "(^|,)${label}="; then
       # Replace
+      # shellcheck disable=SC2001
       current_val=$(echo "$current_val" | sed "s/${label}=[^,]*/${token}/")
     else
       current_val="${current_val},${token}"
@@ -710,8 +711,10 @@ cmd_token_remove() {
     if [[ "$current_val" =~ ^${label}= ]] && [[ ! "$current_val" =~ , ]]; then
       current_val=""
     elif [[ "$current_val" =~ ^${label}=.*,.* ]]; then
+      # shellcheck disable=SC2001
       current_val=$(echo "$current_val" | sed "s/^${label}=[^,]*,//")
     else
+      # shellcheck disable=SC2001
       current_val=$(echo "$current_val" | sed "s/,${label}=[^,]*//")
     fi
     _set_field "$key" "$fnum" "$current_val"
@@ -786,6 +789,7 @@ cmd_export() {
 
   while IFS= read -r line; do
     # Mask all token values (replace =value with =****)
+    # shellcheck disable=SC2001
     content+="$(echo "$line" | sed 's/=[^,|]*/=****/g')
 "
   done < <(_data_lines)
@@ -878,10 +882,8 @@ cmd_update() {
 
 cmd_local() {
   local key="${1:-}"
-  local git_dir
-
   # Check we're in a git repo
-  git_dir=$(git rev-parse --git-dir 2>/dev/null) || die "Not in a git repository."
+  git rev-parse --git-dir >/dev/null 2>&1 || die "Not in a git repository."
 
   if [[ -z "$key" ]]; then
     # Show local override (if any)
