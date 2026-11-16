@@ -27,9 +27,9 @@ GSU_CLEAN_OLD_ALIAS="${GSU_CLEAN_OLD_ALIAS:-1}"
 # ── Colors ────────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-  BLUE='\033[0;34m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+  BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; BOLD=''; DIM=''; NC=''
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; BOLD=''; NC=''
 fi
 
 ok()   { echo -e "${GREEN}  ✓${NC} $*"; }
@@ -137,9 +137,11 @@ main() {
     if _in_file "$GSU_INSTALL_DIR" "$rc_file"; then
       ok "$GSU_INSTALL_DIR already in PATH via $rc_file"
     else
-      echo "" >> "$rc_file"
-      echo "# gsu — Git Switch User" >> "$rc_file"
-      echo "$path_line" >> "$rc_file"
+      {
+        echo ""
+        echo "# gsu — Git Switch User"
+        echo "$path_line"
+      } >> "$rc_file"
       ok "Added PATH entry to $rc_file"
     fi
 

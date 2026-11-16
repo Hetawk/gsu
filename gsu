@@ -8,7 +8,7 @@
 #  Run:    gsu help
 # ==============================================================================
 
-GSU_VERSION="1.1.0"
+GSU_VERSION="1.2.0"
 GSU_REPO="hetawk/gsu"
 GSU_CONFIG_DIR="${GSU_CONFIG_DIR:-$HOME/.config/gsu}"
 GSU_USERS_FILE="$GSU_CONFIG_DIR/users.conf"
@@ -67,9 +67,9 @@ _migrate_legacy() {
   _ensure_config_dir
 
   local old_count
-  old_count=$(grep -v '^#' "$old_users" | grep -v '^[[:space:]]*$' | wc -l | tr -d ' ')
+  old_count=$(grep -cEv '^#|^[[:space:]]*$' "$old_users") || old_count=0
   local new_count
-  new_count=$(grep -v '^#' "$GSU_USERS_FILE" 2>/dev/null | grep -v '^[[:space:]]*$' | wc -l | tr -d ' ')
+  new_count=$(grep -cEv '^#|^[[:space:]]*$' "$GSU_USERS_FILE" 2>/dev/null) || new_count=0
 
   if [[ "$old_count" -gt 0 && "$new_count" -eq 0 ]]; then
     info "Migrating $old_count user(s) from legacy git-users.conf..."
@@ -134,6 +134,156 @@ _field_num() {
     bitbucket|bb) echo 6 ;;
     azure|az)     echo 7 ;;
     *)            die "Unknown service '$1'. Use: github, gitlab, bitbucket, azure" ;;
+  esac
+}
+
+_service_host() {
+  case "$1" in
+    github|gh)    echo "github.com" ;;
+    gitlab|gl)    echo "gitlab.com" ;;
+    bitbucket|bb) echo "bitbucket.org" ;;
+    azure|az)     echo "dev.azure.com" ;;
+    *)            die "Unknown service '$1'. Use: github, gitlab, bitbucket, azure" ;;
+  esac
+}
+
+_install_credential_helper() {
+  local host="$1"
+  local config_key="credential.https://${host}.helper"
+  local helpers=() effective_helpers=() helper
+  local has_host_helpers=0
+
+  while IFS= read -r helper; do
+    helpers+=("$helper")
+    has_host_helpers=1
+  done < <(git config --get-all "$config_key" 2>/dev/null || true)
+
+  if [[ "$has_host_helpers" -eq 0 ]]; then
+    while IFS= read -r helper; do
+      helpers+=("$helper")
+    done < <(git config --get-all credential.helper 2>/dev/null || true)
+  fi
+
+  for helper in "${helpers[@]}"; do
+    if [[ -z "$helper" ]]; then
+      effective_helpers=()
+    elif [[ "$helper" != "!gsu credential" ]]; then
+      effective_helpers+=("$helper")
+    fi
+  done
+
+  git config --global --unset-all "$config_key" >/dev/null 2>&1 || true
+  git config --global --add "$config_key" "" ||
+    die "Could not configure the Git credential helper for $host."
+  git config --global --add "$config_key" "!gsu credential" ||
+    die "Could not configure the Git credential helper for $host."
+
+  for helper in "${effective_helpers[@]}"; do
+    git config --global --add "$config_key" "$helper" ||
+      die "Could not preserve an existing Git credential helper for $host."
+  done
+}
+
+_configure_user_credential_helpers() {
+  local line="$1"
+  local services=("github" "gitlab" "bitbucket" "azure")
+  local fields=(4 5 6 7)
+  local i field
+
+  for i in "${!services[@]}"; do
+    field=$(_get_field "$line" "${fields[$i]}")
+    if [[ -n "$(_credential_token "$field")" ]]; then
+      _install_credential_helper "$(_service_host "${services[$i]}")"
+    fi
+  done
+}
+
+_credential_token() {
+  local field="$1"
+  local label token token_entry first_token=""
+
+  while IFS= read -r token_entry; do
+    [[ "$token_entry" == *=* ]] || continue
+    label="${token_entry%%=*}"
+    token="${token_entry#*=}"
+    token="${token%$'\r'}"
+    [[ -n "$token" ]] || continue
+    if [[ "$label" == "personal" ]]; then
+      printf '%s' "$token"
+      return 0
+    fi
+    [[ -n "$first_token" ]] || first_token="$token"
+  done < <(printf '%s\n' "$field" | tr ',' '\n')
+
+  printf '%s' "$first_token"
+}
+
+cmd_credential() {
+  local operation="${1:-}" service=""
+
+  case "$operation" in
+    get)
+      local protocol="" host="" username="" name="" value=""
+      while IFS='=' read -r name value; do
+        value="${value%$'\r'}"
+        case "$name" in
+          protocol) protocol="$value" ;;
+          host)     host="$value" ;;
+          username) username="$value" ;;
+        esac
+      done
+
+      [[ "$protocol" == "https" ]] || return 0
+      host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+      host="${host%:443}"
+
+      local service=""
+      case "$host" in
+        github.com)    service="github" ;;
+        gitlab.com)    service="gitlab" ;;
+        bitbucket.org) service="bitbucket" ;;
+        dev.azure.com) service="azure" ;;
+        *)             return 0 ;;
+      esac
+
+      local current line token field_num
+      current=$(_get_current)
+      [[ -n "$current" ]] || return 0
+      line=$(_find_user "$current")
+      [[ -n "$line" ]] || return 0
+      field_num=$(_field_num "$service")
+      token=$(_credential_token "$(_get_field "$line" "$field_num")")
+      [[ -n "$token" ]] || return 0
+
+      if [[ -z "$username" ]]; then
+        case "$service" in
+          github)    username="x-access-token" ;;
+          gitlab)    username="oauth2" ;;
+          bitbucket) username="x-token-auth" ;;
+          azure)     username="gsu" ;;
+        esac
+      fi
+      printf 'username=%s\npassword=%s\n\n' "$username" "$token"
+      ;;
+    store|erase)
+      return 0
+      ;;
+    install)
+      service="${2:-}"
+      if [[ -n "$service" ]]; then
+        _install_credential_helper "$(_service_host "$service")"
+        ok "Git credential helper configured for $(_service_host "$service")."
+      else
+        local services=("github" "gitlab" "bitbucket" "azure")
+        for service in "${services[@]}"; do
+          _install_credential_helper "$(_service_host "$service")"
+        done
+        ok "Git credential helpers configured."
+      fi
+      ;;
+    *)
+      die "Usage: gsu credential <get|store|erase|install [service]>"
+      ;;
   esac
 }
 
@@ -304,10 +454,12 @@ cmd_use() {
 
   local uname; uname=$(_get_field "$line" 2)
   local email; email=$(_get_field "$line" 3)
+  local saved_github_token; saved_github_token=$(_credential_token "$(_get_field "$line" 4)")
 
   git config --global user.name  "$uname"
   git config --global user.email "$email"
   _set_current "$key"
+  _configure_user_credential_helpers "$line"
 
   echo
   ok "Switched to user: ${BOLD}$key${NC}"
@@ -321,7 +473,14 @@ cmd_use() {
   _clear_cred bitbucket.org
   _clear_cred dev.azure.com
   local github_switch_status=0
-  _switch_github_cli "$key" || github_switch_status=$?
+  _switch_github_cli "$key" || {
+    local switch_status=$?
+    if [[ -z "$saved_github_token" ]]; then
+      github_switch_status=$switch_status
+    else
+      info "The saved GitHub token will be used for Git operations; the GitHub CLI login was not changed."
+    fi
+  }
   echo
   return "$github_switch_status"
 }
@@ -506,6 +665,7 @@ cmd_token() {
   if [[ -n "$current_val" ]]; then
     if echo "$current_val" | grep -qE "(^|,)${label}="; then
       # Replace
+      # shellcheck disable=SC2001
       current_val=$(echo "$current_val" | sed "s/${label}=[^,]*/${token}/")
     else
       current_val="${current_val},${token}"
@@ -515,6 +675,9 @@ cmd_token() {
   fi
 
   _set_field "$key" "$fnum" "$current_val"
+  local host; host=$(_service_host "$service")
+  _install_credential_helper "$host"
+  info "Git credential helper configured for $host."
   echo
   ok "Token set for ${BOLD}$service${NC} (user: $key, label: $label)"
   echo
@@ -548,8 +711,10 @@ cmd_token_remove() {
     if [[ "$current_val" =~ ^${label}= ]] && [[ ! "$current_val" =~ , ]]; then
       current_val=""
     elif [[ "$current_val" =~ ^${label}=.*,.* ]]; then
+      # shellcheck disable=SC2001
       current_val=$(echo "$current_val" | sed "s/^${label}=[^,]*,//")
     else
+      # shellcheck disable=SC2001
       current_val=$(echo "$current_val" | sed "s/,${label}=[^,]*//")
     fi
     _set_field "$key" "$fnum" "$current_val"
@@ -624,6 +789,7 @@ cmd_export() {
 
   while IFS= read -r line; do
     # Mask all token values (replace =value with =****)
+    # shellcheck disable=SC2001
     content+="$(echo "$line" | sed 's/=[^,|]*/=****/g')
 "
   done < <(_data_lines)
@@ -716,10 +882,8 @@ cmd_update() {
 
 cmd_local() {
   local key="${1:-}"
-  local git_dir
-
   # Check we're in a git repo
-  git_dir=$(git rev-parse --git-dir 2>/dev/null) || die "Not in a git repository."
+  git rev-parse --git-dir >/dev/null 2>&1 || die "Not in a git repository."
 
   if [[ -z "$key" ]]; then
     # Show local override (if any)
@@ -797,6 +961,7 @@ _gsu() {
     'token:Set/update a token'
     'tokens:Manage all tokens for a user'
     'token-remove:Remove a specific token'
+    'credential:Configure Git credential helper'
     'local:Set per-repo git identity'
     'local-clear:Remove per-repo identity override'
     'export:Export users to file (tokens masked)'
@@ -822,12 +987,16 @@ _gsu() {
           compadd -a user_keys ;;
         completions)
           compadd bash zsh fish ;;
+        credential)
+          compadd install ;;
       esac
       ;;
     4)
       case ${words[2]} in
         token|token-remove)
           compadd -a services ;;
+        credential)
+          [[ ${words[3]} == install ]] && compadd -a services ;;
       esac
       ;;
   esac
@@ -842,7 +1011,7 @@ cat <<'BASH_COMP'
 _gsu_completions() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local prev="${COMP_WORDS[COMP_CWORD-1]}"
-  local cmds="list ls use add remove rm edit show token tokens token-remove local local-clear export import update version completions help"
+  local cmds="list ls use add remove rm edit show token tokens token-remove credential local local-clear export import update version completions help"
   local user_keys; user_keys=$(gsu _keys 2>/dev/null | tr '\n' ' ')
   local services="github gitlab bitbucket azure"
   COMPREPLY=()
@@ -854,13 +1023,18 @@ _gsu_completions() {
       COMPREPLY=($(compgen -W "$user_keys" -- "$cur")) ;;
     completions)
       COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
+    credential)
+      COMPREPLY=($(compgen -W "install" -- "$cur")) ;;
   esac
 
-  # 4th word: service name after token/token-remove <user>
+  # 4th word: service after token/token-remove <user>, or credential install
   if [[ ${COMP_CWORD} -eq 3 ]]; then
     case "${COMP_WORDS[1]}" in
       token|token-remove)
         COMPREPLY=($(compgen -W "$services" -- "$cur")) ;;
+      credential)
+        [[ "${COMP_WORDS[2]}" == "install" ]] &&
+          COMPREPLY=($(compgen -W "$services" -- "$cur")) ;;
     esac
   fi
 }
@@ -875,7 +1049,7 @@ function __gsu_users
     gsu _keys 2>/dev/null
 end
 
-set -l gsu_cmds list ls use add remove rm edit show token tokens token-remove local local-clear export import update version completions help
+set -l gsu_cmds list ls use add remove rm edit show token tokens token-remove credential local local-clear export import update version completions help
 
 complete -c gsu -f
 complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "(__gsu_users)" -d "Switch to user"
@@ -888,6 +1062,7 @@ complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "show"        
 complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "token"         -d "Set a token"
 complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "tokens"        -d "Manage tokens"
 complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "token-remove"  -d "Remove a token"
+complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "credential"    -d "Configure Git credentials"
 complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "local"         -d "Per-repo identity"
 complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "local-clear"   -d "Clear per-repo identity"
 complete -c gsu -n "not __fish_seen_subcommand_from $gsu_cmds" -a "export"        -d "Export users"
@@ -900,6 +1075,11 @@ complete -c gsu -n "__fish_seen_subcommand_from use show remove rm edit tokens t
   -a "(__gsu_users)"
 
 complete -c gsu -n "__fish_seen_subcommand_from token token-remove; and test (count (commandline -opc)) -eq 3" \
+  -a "github gitlab bitbucket azure"
+
+complete -c gsu -n "__fish_seen_subcommand_from credential; and test (count (commandline -opc)) -eq 2" \
+  -a "install"
+complete -c gsu -n "__fish_seen_subcommand_from credential; and test (count (commandline -opc)) -eq 3" \
   -a "github gitlab bitbucket azure"
 
 complete -c gsu -n "__fish_seen_subcommand_from completions" -a "bash zsh fish"
@@ -933,6 +1113,7 @@ cmd_help() {
   echo "  gsu tokens        <key>                    View & manage all tokens"
   echo "  gsu token-remove  <key> <service> [label]  Remove a specific token"
   echo "  Services: github, gitlab, bitbucket, azure"
+  echo "  gsu credential install [service]           Enable saved tokens for Git operations"
   echo
   echo -e "${BOLD}PER-REPO IDENTITY${NC}"
   echo "  gsu local        [key]            Set local identity for current repo"
@@ -983,6 +1164,7 @@ main() {
     token)                    cmd_token "${2:-}" "${3:-}" "${4:-}" ;;
     tokens)                   cmd_tokens "${2:-}" ;;
     token-remove|token-rm)    cmd_token_remove "${2:-}" "${3:-}" "${4:-}" ;;
+    credential)               cmd_credential "${2:-}" "${3:-}" ;;
     local)                    _migrate_legacy; cmd_local "${2:-}" ;;
     local-clear)              cmd_local_clear ;;
     export)                   cmd_export "${2:-}" ;;
