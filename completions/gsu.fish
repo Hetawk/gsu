@@ -6,7 +6,7 @@ function __gsu_users
 end
 
 function __gsu_no_subcommand
-    set -l cmds list ls use add remove rm edit show whoami token tokens token-remove local local-clear export import update version completions help
+    set -l cmds list ls use add remove rm edit show whoami token tokens token-remove credential local local-clear export import update version completions help
     not __fish_seen_subcommand_from $cmds
 end
 
@@ -29,6 +29,7 @@ complete -c gsu -n "__gsu_no_subcommand" -a "whoami"       -d "Show current user
 complete -c gsu -n "__gsu_no_subcommand" -a "token"        -d "Set/update a token"
 complete -c gsu -n "__gsu_no_subcommand" -a "tokens"       -d "Manage all tokens"
 complete -c gsu -n "__gsu_no_subcommand" -a "token-remove" -d "Remove a token"
+complete -c gsu -n "__gsu_no_subcommand" -a "credential"   -d "Configure Git credentials"
 complete -c gsu -n "__gsu_no_subcommand" -a "local"        -d "Per-repo identity"
 complete -c gsu -n "__gsu_no_subcommand" -a "local-clear"  -d "Clear per-repo identity"
 complete -c gsu -n "__gsu_no_subcommand" -a "export"       -d "Export users (masked)"
@@ -49,6 +50,11 @@ for _gsu_cmd in token token-remove
     complete -c gsu -n "__fish_seen_subcommand_from $_gsu_cmd; and test (count (commandline -opc)) -eq 3" \
         -a "github gitlab bitbucket azure"
 end
+
+complete -c gsu -n "__fish_seen_subcommand_from credential; and test (count (commandline -opc)) -eq 2" \
+        -a "install"
+complete -c gsu -n "__fish_seen_subcommand_from credential; and test (count (commandline -opc)) -eq 3" \
+        -a "github gitlab bitbucket azure"
 
 # Shell argument for completions
 complete -c gsu -n "__fish_seen_subcommand_from completions; and test (count (commandline -opc)) -eq 2" \

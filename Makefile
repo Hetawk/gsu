@@ -58,12 +58,13 @@ completions: completions/gsu.zsh completions/gsu.bash completions/gsu.fish
 
 lint:
 	@command -v shellcheck >/dev/null 2>&1 || { echo "shellcheck not found. Install shellcheck via your OS package manager."; exit 1; }
-	shellcheck -s bash gsu install.sh uninstall.sh
+	shellcheck -s bash gsu install.sh uninstall.sh tests/credential.sh
 	@echo "  ✓ Lint passed"
 
 test: install
 	@echo ""
 	@echo "  Running smoke tests..."
+	@bash tests/credential.sh
 	@$(BINDIR)/gsu version >/dev/null && echo "  ✓ gsu version" || echo "  ✗ gsu version FAILED"
 	@$(BINDIR)/gsu help >/dev/null && echo "  ✓ gsu help" || echo "  ✗ gsu help FAILED"
 	@$(BINDIR)/gsu list 2>/dev/null; echo "  ✓ gsu list (exit $$?)"

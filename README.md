@@ -7,7 +7,7 @@
 
 ## Features
 
-- **One command to switch**: `gsu hetawk` — switch and clear cached credentials
+- **One command to switch**: `gsu hetawk` — switch identity and use its saved Git tokens
 - **Multi-service tokens**: GitHub, GitLab, Bitbucket, Azure DevOps
 - **Per-repo identity**: `gsu local work` overrides global config for one repo
 - **Tab completion**: Zsh, Bash, and Fish supported
@@ -106,8 +106,10 @@ gsu use hetawk             # same — explicit form
 Switching:
 
 1. Sets `git config --global user.name` and `user.email`
-2. Clears cached credentials (GitHub, GitLab, Bitbucket, Azure)
-3. Switches the authenticated GitHub CLI account with
+2. Configures GSU as the first credential helper for services with saved tokens,
+   retaining existing helpers as fallbacks
+3. Clears cached credentials (GitHub, GitLab, Bitbucket, Azure)
+4. Switches the authenticated GitHub CLI account with
    `gh auth switch --hostname github.com --user <github-login>`
 
 The profile key is matched case-insensitively against authenticated GitHub
@@ -129,13 +131,19 @@ gsu remove hetawk                    # remove a user
 
 ### Token management
 
-Tokens are optional. They're stored locally and can be used as reference or applied to your credential helper.
+Tokens are stored locally and used by Git for HTTPS operations when their GSU
+profile is active. Saving a token configures GSU as the first Git credential
+helper for that service; existing credential helpers remain as fallbacks.
+Switching to a profile also configures helpers for any tokens already saved
+there. To configure all supported service hosts manually, run
+`gsu credential install`; add a service argument to configure just one host.
 
 ```bash
 gsu token hetawk github              # set GitHub token (interactive)
 gsu token hetawk github ghp_xxx      # set directly
 gsu tokens hetawk                    # view/manage all tokens
 gsu token-remove hetawk github work  # remove the 'work' label token
+gsu credential install github        # enable GSU Git credentials for GitHub
 ```
 
 **Named tokens** — one user, multiple tokens:
@@ -145,6 +153,14 @@ gsu token-remove hetawk github work  # remove the 'work' label token
 gsu token hetawk github personal=ghp_token1
 gsu token hetawk github work=ghp_token2
 ```
+
+When multiple tokens are saved for a service, GSU uses the `personal` token if
+present, otherwise the first configured token. GSU currently maps GitHub,
+GitLab.com, Bitbucket.org, and Azure DevOps at `dev.azure.com`; self-hosted
+service domains are not detected automatically. The GitHub CLI login is
+separate from Git credentials: a saved GSU token can authenticate Git even
+when `gh auth status` reports a problem, but it does not authenticate `gh`
+commands.
 
 ### Per-repo identity
 
@@ -209,6 +225,8 @@ work|Work Identity|me@work.com|personal=ghp_yyy,ci=ghp_zzz|||
 > ⚠️ **Security:** tokens are stored in plain text.  
 > Protect the file: `chmod 600 ~/.config/gsu/users.conf`  
 > For production environments, prefer your system's credential manager (GCM, osxkeychain).
+> Git receives the selected token through Git's credential-helper protocol;
+> GSU does not print it during normal commands.
 
 ### Environment variables
 

@@ -19,6 +19,7 @@ _gsu() {
     'token:Set or update a token for a service'
     'tokens:View and manage all tokens for a user'
     'token-remove:Remove a specific named token'
+    'credential:Configure Git credential helper'
     'local:Set per-repo git identity'
     'local-clear:Remove per-repo identity override'
     'export:Export users to file (tokens masked)'
@@ -44,6 +45,8 @@ _gsu() {
           compadd -a user_keys ;;
         completions)
           compadd bash zsh fish ;;
+        credential)
+          compadd install ;;
         export)
           _files ;;
         import)
@@ -54,6 +57,8 @@ _gsu() {
       case ${words[2]} in
         token|token-remove)
           compadd -a services ;;
+        credential)
+          [[ ${words[3]} == install ]] && compadd -a services ;;
       esac
       ;;
   esac

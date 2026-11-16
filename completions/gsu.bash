@@ -7,7 +7,7 @@ _gsu_completions() {
   local prev="${COMP_WORDS[COMP_CWORD-1]}"
   local cmd="${COMP_WORDS[1]}"
 
-  local all_cmds="list ls use add remove rm edit show whoami token tokens token-remove local local-clear export import update version completions help"
+  local all_cmds="list ls use add remove rm edit show whoami token tokens token-remove credential local local-clear export import update version completions help"
   local user_keys; user_keys=$(gsu _keys 2>/dev/null | tr '\n' ' ')
   local services="github gitlab bitbucket azure"
 
@@ -28,15 +28,20 @@ _gsu_completions() {
         COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
       export|import)
         COMPREPLY=($(compgen -f -- "$cur")) ;;
+      credential)
+        COMPREPLY=($(compgen -W "install" -- "$cur")) ;;
     esac
     return
   fi
 
-  # Word 3: service after token/token-remove <user>
+  # Word 3: service after token/token-remove <user>, or credential install
   if [[ $COMP_CWORD -eq 3 ]]; then
     case "$cmd" in
       token|token-remove)
         COMPREPLY=($(compgen -W "$services" -- "$cur")) ;;
+      credential)
+        [[ "${COMP_WORDS[2]}" == "install" ]] &&
+          COMPREPLY=($(compgen -W "$services" -- "$cur")) ;;
     esac
     return
   fi
