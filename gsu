@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  gsu — Git Switch User  v1.0.0
+#  gsu — Git Switch User  v1.1.0
 #  Manage and switch between multiple Git identities
 #  https://github.com/hetawk/gsu
 #
@@ -8,7 +8,7 @@
 #  Run:    gsu help
 # ==============================================================================
 
-GSU_VERSION="1.0.0"
+GSU_VERSION="1.1.0"
 GSU_REPO="hetawk/gsu"
 GSU_CONFIG_DIR="${GSU_CONFIG_DIR:-$HOME/.config/gsu}"
 GSU_USERS_FILE="$GSU_CONFIG_DIR/users.conf"
@@ -159,6 +159,39 @@ _clear_cred() {
   printf "protocol=https\nhost=%s\n\n" "$host" | git credential reject 2>/dev/null || true
 }
 
+# Switch the GitHub CLI account when the profile key matches its GitHub login.
+_switch_github_cli() {
+  local key="$1"
+  local github_user
+
+  if ! command -v gh >/dev/null 2>&1; then
+    warn "GitHub CLI ('gh') is not installed; GitHub CLI account was not switched."
+    return 0
+  fi
+
+  github_user=$(
+    gh auth status --hostname github.com 2>&1 |
+      sed -nE 's/.*account ([^ ]+) \(.*/\1/p' |
+      awk -v wanted="$key" 'tolower($0) == tolower(wanted) { print; exit }'
+  )
+  if [[ -z "$github_user" ]]; then
+    warn "GitHub CLI account '$key' is not authenticated."
+    echo "  Run: gh auth login --hostname github.com"
+    echo "  Or authenticate '$key' before switching with gsu."
+    return 1
+  fi
+
+  if gh auth switch --hostname github.com --user "$github_user" >/dev/null 2>&1; then
+    info "GitHub CLI account switched to: $github_user"
+    return 0
+  fi
+
+  warn "GitHub CLI account '$github_user' could not be selected."
+  echo "  Run: gh auth login --hostname github.com"
+  echo "  Or verify that '$github_user' is available to the GitHub CLI."
+  return 1
+}
+
 # ── Core commands ─────────────────────────────────────────────────────────────
 
 cmd_show() {
@@ -287,7 +320,10 @@ cmd_use() {
   _clear_cred gitlab.com
   _clear_cred bitbucket.org
   _clear_cred dev.azure.com
+  local github_switch_status=0
+  _switch_github_cli "$key" || github_switch_status=$?
   echo
+  return "$github_switch_status"
 }
 
 cmd_add() {

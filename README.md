@@ -107,6 +107,14 @@ Switching:
 
 1. Sets `git config --global user.name` and `user.email`
 2. Clears cached credentials (GitHub, GitLab, Bitbucket, Azure)
+3. Switches the authenticated GitHub CLI account with
+   `gh auth switch --hostname github.com --user <github-login>`
+
+The profile key is matched case-insensitively against authenticated GitHub
+logins, so a profile such as `hetawk` can select the GitHub login `Hetawk`.
+Each GitHub account must already be authenticated with `gh auth login`. If the
+GitHub CLI is unavailable or the account is not authenticated, `gsu` still
+changes the Git identity but reports that the CLI account was not switched.
 
 ### User management
 
